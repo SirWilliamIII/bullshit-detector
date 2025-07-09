@@ -390,8 +390,35 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     timestamp: new Date().toISOString(),
     apiKey: process.env.ANTHROPIC_API_KEY ? 'configured' : 'missing',
-    analysisPipeline: bullshitDetector ? 'ready' : 'unavailable'
+    analysisPipeline: bullshitDetector ? 'ready' : 'unavailable',
+    verificationEngine: global.verificationEngine ? 'initialized' : 'not_initialized'
   });
+});
+
+// Verification engine status and statistics
+app.get('/api/verification-status', async (req, res) => {
+  try {
+    if (!global.verificationEngine) {
+      return res.json({
+        initialized: false,
+        message: 'Verification engine not initialized'
+      });
+    }
+
+    const stats = global.verificationEngine.getStats();
+    
+    res.json({
+      initialized: true,
+      stats,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to get verification status',
+      message: error.message
+    });
+  }
 });
 
 // FIXED: NEW - Your sophisticated image analysis endpoint
@@ -559,7 +586,7 @@ Respond with ONLY valid JSON:
   }
 }
 
-// FIXED: Enhanced text analysis endpoint
+// ENHANCED: Real-time verification endpoint with multi-source validation
 app.post('/api/analyze-text', async (req, res) => {
   try {
     const { text } = req.body;
@@ -568,25 +595,92 @@ app.post('/api/analyze-text', async (req, res) => {
       return res.status(400).json({ error: 'Text is required' });
     }
     
-    // ENHANCED SCAM DETECTION FIRST
-    const enhancedAnalysis = enhancedScamDetection(text);
+    console.log('🔍 Starting real-time verification analysis...');
     
-    // Extract domains/URLs from text for analysis
-    const urlRegex = /https?:\/\/([\w.-]+)/gi;
-    const domains = [];
-    let match;
-    
-    while ((match = urlRegex.exec(text)) !== null) {
-      domains.push(match[1]);
+    // Initialize verification engine if not already done
+    if (!global.verificationEngine) {
+      console.log('🔄 Initializing verification engine...');
+      const VerificationEngine = require('./services/verification/VerificationEngine');
+      global.verificationEngine = new VerificationEngine();
+      await global.verificationEngine.initialize();
     }
     
-    // Analyze domains if found
-    const domainAnalyses = await Promise.all(
-      domains.slice(0, 3).map(domain => analyzeDomain(domain))
-    );
+    try {
+      // Use the new real-time verification system
+      const verificationResult = await global.verificationEngine.verify(text, {
+        maxSources: 3,
+        timeout: 25000,
+        bypassCache: req.body.bypassCache || false
+      });
+      
+      if (verificationResult.success) {
+        console.log('✅ Real-time verification completed:', verificationResult.verdict);
+        
+        // Transform result to match expected format
+        const transformedResult = {
+          suspicionLevel: verificationResult.verdict === 'VERIFIED' ? 'LOW' : 
+                         verificationResult.verdict === 'CONTRADICTED' ? 'HIGH' : 'MEDIUM',
+          findings: verificationResult.explanation.details || [],
+          questions: ['Does this information seem accurate based on current sources?'],
+          calculations: {
+            confidence_score: verificationResult.confidence,
+            final_verdict: verificationResult.explanation.summary,
+            verification_sources: verificationResult.sources.results.map(s => s.source),
+            consensus: verificationResult.consensus
+          }
+        };
+        
+        res.json({
+          success: true,
+          analysis: transformedResult,
+          verificationResult: verificationResult, // Include full verification data
+          method: 'real_time_verification',
+          timestamp: new Date().toISOString()
+        });
+        
+      } else {
+        // Fallback to enhanced detection if verification fails
+        console.log('⚠️ Real-time verification failed, using fallback...');
+        await handleFallbackAnalysis(text, res, verificationResult.error);
+      }
+      
+    } catch (verificationError) {
+      console.error('❌ Real-time verification error:', verificationError.message);
+      await handleFallbackAnalysis(text, res, verificationError.message);
+    }
     
-    // Enhanced Claude prompt that includes our pre-analysis
-    const analysisPrompt = `You are a bullshit detection expert. A preliminary analysis has already been conducted.
+  } catch (error) {
+    console.error('❌ Text analysis error:', error);
+    res.status(500).json({ 
+      error: 'Analysis failed', 
+      message: error.message 
+    });
+  }
+});
+
+// Fallback analysis function
+async function handleFallbackAnalysis(text, res, verificationError) {
+  console.log('🔄 Using fallback analysis method...');
+  
+  // ENHANCED SCAM DETECTION FIRST
+  const enhancedAnalysis = enhancedScamDetection(text);
+  
+  // Extract domains/URLs from text for analysis
+  const urlRegex = /https?:\/\/([\w.-]+)/gi;
+  const domains = [];
+  let match;
+  
+  while ((match = urlRegex.exec(text)) !== null) {
+    domains.push(match[1]);
+  }
+  
+  // Analyze domains if found
+  const domainAnalyses = await Promise.all(
+    domains.slice(0, 3).map(domain => analyzeDomain(domain))
+  );
+  
+  // Enhanced Claude prompt that includes our pre-analysis
+  const analysisPrompt = `You are a bullshit detection expert. A preliminary analysis has already been conducted.
 
 Text to analyze: "${text}"
 
@@ -622,52 +716,49 @@ Respond with ONLY a valid JSON object in this exact format:
 
 DO NOT include any text outside the JSON.`;
 
-    try {
-      const claudeResponse = await analyzeWithClaude(analysisPrompt);
-      const claudeAnalysis = JSON.parse(claudeResponse);
-      
-      // Use the HIGHER suspicion level between our analysis and Claude's
-      const finalSuspicionLevel = 
-        enhancedAnalysis.suspicionLevel === 'HIGH' || claudeAnalysis.suspicionLevel === 'HIGH' ? 'HIGH' :
-        enhancedAnalysis.suspicionLevel === 'MEDIUM' || claudeAnalysis.suspicionLevel === 'MEDIUM' ? 'MEDIUM' : 
-        'LOW';
-      
-      const finalAnalysis = {
-        ...claudeAnalysis,
-        suspicionLevel: finalSuspicionLevel,
-        enhancedDetection: {
-          score: enhancedAnalysis.calculations.suspicionScore,
-          patterns: enhancedAnalysis.calculations.riskFactors,
-          recommendation: enhancedAnalysis.calculations.recommendation
-        }
-      };
-      
-      res.json({
-        success: true,
-        analysis: finalAnalysis,
-        domainData: domainAnalyses
-      });
-      
-    } catch (claudeError) {
-      console.log('Claude unavailable, using enhanced detection only');
-      
-      // If Claude fails, use our enhanced detection
-      res.json({
-        success: true,
-        analysis: enhancedAnalysis,
-        domainData: domainAnalyses,
-        note: 'Analysis completed with local detection (Claude unavailable)'
-      });
-    }
+  try {
+    const claudeResponse = await analyzeWithClaude(analysisPrompt);
+    const claudeAnalysis = JSON.parse(claudeResponse);
     
-  } catch (error) {
-    console.error('Text analysis error:', error);
-    res.status(500).json({ 
-      error: 'Analysis failed', 
-      message: error.message 
+    // Use the HIGHER suspicion level between our analysis and Claude's
+    const finalSuspicionLevel = 
+      enhancedAnalysis.suspicionLevel === 'HIGH' || claudeAnalysis.suspicionLevel === 'HIGH' ? 'HIGH' :
+      enhancedAnalysis.suspicionLevel === 'MEDIUM' || claudeAnalysis.suspicionLevel === 'MEDIUM' ? 'MEDIUM' : 
+      'LOW';
+    
+    const finalAnalysis = {
+      ...claudeAnalysis,
+      suspicionLevel: finalSuspicionLevel,
+      enhancedDetection: {
+        score: enhancedAnalysis.calculations.suspicionScore,
+        patterns: enhancedAnalysis.calculations.riskFactors,
+        recommendation: enhancedAnalysis.calculations.recommendation
+      }
+    };
+    
+    res.json({
+      success: true,
+      analysis: finalAnalysis,
+      domainData: domainAnalyses,
+      method: 'fallback_analysis',
+      note: `Real-time verification unavailable: ${verificationError}`,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (claudeError) {
+    console.log('Claude unavailable, using enhanced detection only');
+    
+    // If Claude fails, use our enhanced detection
+    res.json({
+      success: true,
+      analysis: enhancedAnalysis,
+      domainData: domainAnalyses,
+      method: 'enhanced_detection_only',
+      note: 'Analysis completed with local detection (Claude and real-time verification unavailable)',
+      timestamp: new Date().toISOString()
     });
   }
-});
+}
 
 // Investigation endpoint (keeping your existing logic)
 app.post('/api/investigate', async (req, res) => {
@@ -788,6 +879,17 @@ app.use((error, req, res, next) => {
 // FIXED: Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('Received SIGTERM, shutting down gracefully');
+  
+  // Clean up verification engine
+  if (global.verificationEngine) {
+    try {
+      await global.verificationEngine.cleanup();
+    } catch (error) {
+      console.error('Error cleaning up verification engine:', error.message);
+    }
+  }
+  
+  // Clean up original bullshit detector
   if (bullshitDetector) {
     try {
       await bullshitDetector.terminate();
@@ -795,11 +897,23 @@ process.on('SIGTERM', async () => {
       console.error('Error terminating bullshit detector:', error.message);
     }
   }
+  
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
   console.log('Received SIGINT, shutting down gracefully');
+  
+  // Clean up verification engine
+  if (global.verificationEngine) {
+    try {
+      await global.verificationEngine.cleanup();
+    } catch (error) {
+      console.error('Error cleaning up verification engine:', error.message);
+    }
+  }
+  
+  // Clean up original bullshit detector
   if (bullshitDetector) {
     try {
       await bullshitDetector.terminate();
@@ -807,6 +921,7 @@ process.on('SIGINT', async () => {
       console.error('Error terminating bullshit detector:', error.message);
     }
   }
+  
   process.exit(0);
 });
 
