@@ -21,17 +21,21 @@
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.3",
+    "@octokit/rest": "^20.1.2",
     "axios": "^1.7.7",
     "cors": "^2.8.5",
     "dotenv": "^17.1.0",
     "express": "^4.19.2",
     "helmet": "^8.0.0",
     "multer": "^2.0.1",
+    "pg": "^8.16.3",
     "puppeteer": "^23.0.2",
     "rate-limiter-flexible": "^5.0.3",
     "sharp": "^0.33.5",
     "tesseract.js": "^5.1.1",
-    "whois": "^2.13.5"
+    "uuid": "^11.1.0",
+    "whois": "^2.13.5",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "eslint": "^9.9.1",

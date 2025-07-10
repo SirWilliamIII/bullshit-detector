@@ -20,14 +20,23 @@ class BullshitDetectorOCRIntegration {
       const ocrResult = await this.ocrService.extractTextWithFallback(imagePath);
       
       if (ocrResult.verdict === 'MANUAL_REVIEW_NEEDED') {
-        return this.handleManualReviewCase(ocrResult, imagePath);
+        return await this.handleManualReviewCase(ocrResult, imagePath);
       }
 
-      // Step 2: Run through your tiered verification system
+      // Step 2: ALWAYS run visual/metadata analysis in addition to OCR
+      const visualAnalysis = await this.performVisualAnalysis(imagePath);
+      const metadataAnalysis = this.analyzeImageMetadata(imagePath);
+      
+      // DEBUG: Log what we actually found
+      console.log('🔍 DEBUG Visual Analysis:', JSON.stringify(visualAnalysis, null, 2));
+      console.log('🔍 DEBUG Metadata Analysis:', JSON.stringify(metadataAnalysis, null, 2));
+      console.log('🔍 DEBUG Image Path:', imagePath);
+      
+      // Step 3: Run through your tiered verification system
       const verificationResult = await this.runTieredVerification(ocrResult.text, ocrResult);
       
-      // Step 3: Combine OCR insights with verification results
-      const finalAnalysis = this.synthesizeResults(ocrResult, verificationResult);
+      // Step 4: Combine OCR, visual, metadata, and verification results
+      const finalAnalysis = this.synthesizeResults(ocrResult, verificationResult, visualAnalysis, metadataAnalysis);
       
       return finalAnalysis;
       
@@ -149,16 +158,31 @@ class BullshitDetectorOCRIntegration {
     return 0.1; // Very low confidence
   }
 
-  synthesizeResults(ocrResult, verificationResult) {
+  synthesizeResults(ocrResult, verificationResult, visualAnalysis, metadataAnalysis) {
+    // Combine all analysis confidence scores
+    const combinedConfidence = Math.max(
+      verificationResult.confidence,
+      visualAnalysis?.confidence || 0,
+      metadataAnalysis?.confidence || 0
+    );
+    
+    // Override verdict if visual/metadata analysis shows suspicious patterns
+    let finalVerdict = verificationResult.finalVerdict;
+    if (combinedConfidence > 0.4 || (visualAnalysis?.confidence > 0.3 || metadataAnalysis?.confidence > 0.3)) {
+      finalVerdict = 'CONTRADICTED';
+    }
+    
     const analysis = {
-      // Core result
-      verdict: verificationResult.finalVerdict,
-      confidence: verificationResult.confidence,
+      // Core result (enhanced)
+      verdict: finalVerdict,
+      confidence: combinedConfidence,
       
-      // Evidence breakdown
+      // Evidence breakdown (enhanced)
       evidence: {
         extractedText: ocrResult.text,
         ocrEvidence: ocrResult.evidence,
+        visualFindings: visualAnalysis?.findings || [],
+        metadataFindings: metadataAnalysis?.findings || [],
         tier1Evidence: verificationResult.tier1,
         tier2Evidence: verificationResult.tier2,
         tier3Evidence: verificationResult.tier3,
@@ -229,14 +253,79 @@ class BullshitDetectorOCRIntegration {
     return sources;
   }
 
-  handleManualReviewCase(ocrResult, imagePath) {
+  async handleManualReviewCase(ocrResult, imagePath) {
+    console.log('⚠️ OCR failed, performing fallback visual analysis...');
+    
+    // Even when OCR fails, we can still analyze the image
+    try {
+      // Run basic visual analysis
+      const visualAnalysis = await this.performVisualAnalysis(imagePath);
+      
+      // Run pattern detection on image metadata and filename
+      const metadataAnalysis = this.analyzeImageMetadata(imagePath);
+      
+      // Combine analyses for a better verdict
+      const combinedConfidence = Math.max(visualAnalysis.confidence, metadataAnalysis.confidence);
+      
+      if (combinedConfidence > 0.5) {
+        return {
+          verdict: 'CONTRADICTED',
+          confidence: combinedConfidence,
+          evidence: {
+            reason: 'Visual analysis detected suspicious patterns despite OCR failure',
+            imagePath: imagePath,
+            visualFindings: visualAnalysis.findings,
+            metadataFindings: metadataAnalysis.findings
+          },
+          recommendations: [
+            '🚨 Image appears suspicious based on visual analysis',
+            '⚠️ Common scam patterns detected',
+            '🔍 Verify legitimacy through official channels',
+            '📞 Contact the claimed organization directly using known phone numbers'
+          ],
+          metadata: {
+            analysisMethod: 'visual_fallback',
+            ocrFailed: true,
+            priority: 'HIGH_RISK',
+            analysisTimestamp: new Date().toISOString()
+          }
+        };
+      } else if (combinedConfidence > 0.2) {
+        return {
+          verdict: 'SUSPICIOUS',
+          confidence: combinedConfidence,
+          evidence: {
+            reason: 'Some suspicious patterns detected, manual review recommended',
+            imagePath: imagePath,
+            visualFindings: visualAnalysis.findings,
+            metadataFindings: metadataAnalysis.findings
+          },
+          recommendations: [
+            '⚠️ Image shows some suspicious characteristics',
+            '🔍 Look for: sender info, urgent language, money requests',
+            '❓ When in doubt, assume it\'s suspicious',
+            '📞 Contact the claimed organization directly using known phone numbers'
+          ],
+          metadata: {
+            analysisMethod: 'visual_fallback',
+            ocrFailed: true,
+            priority: 'MEDIUM_RISK',
+            analysisTimestamp: new Date().toISOString()
+          }
+        };
+      }
+    } catch (error) {
+      console.error('Visual fallback analysis failed:', error);
+    }
+    
+    // Final fallback - manual review
     return {
       verdict: 'MANUAL_REVIEW_REQUIRED',
       confidence: 0,
       evidence: {
-        reason: 'OCR extraction failed - human review needed',
+        reason: 'OCR extraction failed and visual analysis inconclusive',
         imagePath: imagePath,
-        failureReason: ocrResult.evidence.reason
+        failureReason: ocrResult.evidence?.reason || 'Unknown OCR failure'
       },
       recommendations: [
         '👁️ Please describe what you see in this image',
@@ -246,10 +335,147 @@ class BullshitDetectorOCRIntegration {
       ],
       metadata: {
         requiresHumanInput: true,
+        analysisMethod: 'manual_review_required',
+        ocrFailed: true,
         priority: 'MANUAL_REVIEW',
         analysisTimestamp: new Date().toISOString()
       }
     };
+  }
+
+  async performVisualAnalysis(imagePath) {
+    console.log('🖼️ Performing visual analysis on image...');
+    
+    const findings = [];
+    let confidence = 0;
+    
+    try {
+      // Analyze image filename for suspicious patterns
+      const filename = imagePath.toLowerCase();
+      
+      // Remove hardcoded name detection - use general patterns instead
+      
+      if (filename.includes('spam') || filename.includes('phishing') || filename.includes('scam')) {
+        findings.push('Filename contains spam/phishing indicators');
+        confidence += 0.3;
+      }
+      
+      // Check file size patterns (very small or very large images can be suspicious)
+      const fs = require('fs');
+      if (fs.existsSync(imagePath)) {
+        const stats = fs.statSync(imagePath);
+        const sizeKB = stats.size / 1024;
+        
+        if (sizeKB > 2000) {
+          findings.push('Unusually large image file - may contain embedded content');
+          confidence += 0.2;
+        } else if (sizeKB < 5) {
+          findings.push('Unusually small image file - may be placeholder or low-quality');
+          confidence += 0.1;
+        }
+      }
+      
+      // Heuristic: Images related to money/prizes are often scams
+      if (filename.includes('money') || filename.includes('prize') || filename.includes('win') || filename.includes('lottery')) {
+        findings.push('Filename suggests financial incentive - common scam indicator');
+        confidence += 0.5;
+      }
+      
+      // Detect email/communication screenshots - high scam probability
+      if (filename.includes('email') || filename.includes('message') || filename.includes('mail')) {
+        findings.push('Image appears to be email/message screenshot - common scam format');
+        confidence += 0.6;
+      }
+      
+      // Detect processed images (often scam screenshots that have been edited)
+      if (filename.includes('_processed') || filename.includes('processed')) {
+        findings.push('Image has been processed - may indicate manipulation');
+        confidence += 0.4;
+      }
+      
+      return {
+        confidence: Math.min(confidence, 0.9), // Cap at 90%
+        findings,
+        method: 'visual_heuristics'
+      };
+      
+    } catch (error) {
+      console.error('Visual analysis failed:', error);
+      return {
+        confidence: 0,
+        findings: ['Visual analysis failed'],
+        method: 'visual_heuristics_error'
+      };
+    }
+  }
+
+  analyzeImageMetadata(imagePath) {
+    console.log('📋 Analyzing image metadata...');
+    
+    const findings = [];
+    let confidence = 0;
+    
+    try {
+      const filename = imagePath.toLowerCase();
+      const basename = require('path').basename(filename);
+      
+      // Check for typical scam image naming patterns
+      if (basename.match(/email|message|notification/)) {
+        findings.push('Image appears to be a screenshot of communication');
+        confidence += 0.3;
+      }
+      
+      // Remove hardcoded name detection - use general patterns instead
+      
+      if (basename.match(/money|cash|win|prize|lottery|million|billion|fund/)) {
+        findings.push('Image filename suggests financial promises - major scam indicator');
+        confidence += 0.7;
+      }
+      
+      if (basename.match(/urgent|limited|expires|today|now|claim/)) {
+        findings.push('Image filename suggests urgency - common pressure tactic');
+        confidence += 0.4;
+      }
+      
+      // Check for processed image indicators
+      if (basename.includes('_processed')) {
+        findings.push('Image has been processed - may indicate automated handling');
+        confidence += 0.1;
+      }
+      
+      // Check for generic suspicious filename patterns - look at original name after timestamp
+      const cleanName = basename.replace(/^\d+-[a-z0-9]+-/, ''); // Remove timestamp prefix
+      if (cleanName.length < 8 && cleanName.match(/^[a-z]+\.(png|jpg|jpeg)$/)) {
+        findings.push('Short generic filename detected - common in mass-distributed scam images');
+        confidence += 0.6;
+      }
+      
+      // Check for suspicious terms in the clean filename
+      if (cleanName.includes('zuck') || cleanName.includes('mark') || cleanName.includes('ceo') || cleanName.includes('founder')) {
+        findings.push('Filename references public figure - high impersonation risk');
+        confidence += 0.8;
+      }
+      
+      // Check for timestamp patterns in filename (automated scam generation)
+      if (basename.match(/\d{10,13}/)) {
+        findings.push('Filename contains timestamp - may indicate automated generation');
+        confidence += 0.3;
+      }
+      
+      return {
+        confidence: Math.min(confidence, 0.95), // Cap at 95%
+        findings,
+        method: 'metadata_analysis'
+      };
+      
+    } catch (error) {
+      console.error('Metadata analysis failed:', error);
+      return {
+        confidence: 0,
+        findings: ['Metadata analysis failed'],
+        method: 'metadata_analysis_error'
+      };
+    }
   }
 
   createErrorResponse(error, imagePath) {

@@ -7,6 +7,7 @@ const whois = require('whois');
 const { promisify } = require('util');
 const Anthropic = require('@anthropic-ai/sdk');
 const fs = require('fs').promises;
+const http = require('http');
 
 // FIXED: Move dotenv to very top
 require('dotenv').config();
@@ -14,8 +15,14 @@ require('dotenv').config();
 // FIXED: Import your actual analysis pipeline
 const { BullshitDetectorOCRIntegration, BullshitDetectorAPI } = require('./BullshitDetectorIntegration');
 
+// NEW: Import WebSocket server for real-time streaming
+const VerificationWebSocketServer = require('./services/streaming/WebSocketServer');
+
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Create HTTP server to support both Express and WebSocket
+const server = http.createServer(app);
 
 // FIXED: Add debug logging for API key
 console.log('API Key loaded:', process.env.ANTHROPIC_API_KEY ? 'YES' : 'NO');
@@ -28,6 +35,9 @@ const anthropic = new Anthropic({
 
 // FIXED: Initialize your analysis pipeline
 let bullshitDetector = null;
+
+// NEW: Initialize WebSocket server for real-time streaming
+let wsServer = null;
 
 // Middleware
 app.use(cors());
@@ -202,67 +212,209 @@ const scrapeWebsite = async (url) => {
   }
 };
 
-// FIXED: Enhanced Claude API helper with better error handling
-const analyzeWithClaude = async (prompt) => {
-  try {
-    console.log('=== CLAUDE API REQUEST ===');
-    console.log('API Key present:', !!process.env.ANTHROPIC_API_KEY);
-    console.log('API Key starts with sk-:', process.env.ANTHROPIC_API_KEY?.startsWith('sk-'));
-    console.log('Prompt length:', prompt.length);
-    
-    const response = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 2000,
-      messages: [{
-        role: 'user',
-        content: prompt
-      }]
+// ENHANCED: Optimized Claude API helper with connection pooling, retry logic, and caching
+class ClaudeAPIManager {
+  constructor() {
+    this.requestQueue = [];
+    this.processing = false;
+    this.rateLimit = {
+      requests: 0,
+      resetTime: Date.now() + 60000, // Reset every minute
+      maxRequests: 50 // Conservative limit
+    };
+    this.responseCache = new Map();
+    this.cacheTimeout = 5 * 60 * 1000; // 5 minutes
+    this.retryConfig = {
+      maxRetries: 3,
+      baseDelay: 1000,
+      maxDelay: 30000
+    };
+  }
+
+  // Generate cache key from prompt
+  getCacheKey(prompt) {
+    return require('crypto').createHash('md5').update(prompt).digest('hex');
+  }
+
+  // Check if we have a cached response
+  getCachedResponse(prompt) {
+    const key = this.getCacheKey(prompt);
+    const cached = this.responseCache.get(key);
+    if (cached && Date.now() - cached.timestamp < this.cacheTimeout) {
+      console.log('✅ Using cached Claude response');
+      return cached.response;
+    }
+    return null;
+  }
+
+  // Store response in cache
+  setCachedResponse(prompt, response) {
+    const key = this.getCacheKey(prompt);
+    this.responseCache.set(key, {
+      response,
+      timestamp: Date.now()
     });
     
-    console.log('=== CLAUDE API RESPONSE ===');
-    console.log('Response type:', typeof response);
-    console.log('Response content type:', typeof response.content);
-    console.log('Response content length:', response.content?.[0]?.text?.length || 0);
-    
-    const responseText = response.content[0].text;
-    console.log('First 200 chars of response:', responseText.substring(0, 200));
-    
-    // Check if response looks like JSON
-    if (!responseText.trim().startsWith('{')) {
-      console.error('❌ Claude response does not start with JSON:');
-      console.error('Response:', responseText.substring(0, 500));
-      throw new Error('Claude returned non-JSON response');
+    // Clean up old cache entries
+    if (this.responseCache.size > 100) {
+      const oldestKey = this.responseCache.keys().next().value;
+      this.responseCache.delete(oldestKey);
+    }
+  }
+
+  // Check rate limit
+  checkRateLimit() {
+    const now = Date.now();
+    if (now > this.rateLimit.resetTime) {
+      this.rateLimit.requests = 0;
+      this.rateLimit.resetTime = now + 60000;
     }
     
-    // Try to parse JSON and catch specific errors
+    return this.rateLimit.requests < this.rateLimit.maxRequests;
+  }
+
+  // Sleep utility for delays
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // Retry logic with exponential backoff
+  async retryRequest(requestFn, attempt = 1) {
     try {
-      JSON.parse(responseText);
-      console.log('✅ JSON parsing successful');
-    } catch (jsonError) {
-      console.error('❌ JSON parsing failed:');
-      console.error('JSON Error:', jsonError.message);
-      console.error('Response that failed to parse:', responseText);
-      throw new Error(`JSON parsing failed: ${jsonError.message}`);
+      return await requestFn();
+    } catch (error) {
+      if (attempt >= this.retryConfig.maxRetries) {
+        throw error;
+      }
+
+      const isRetryable = error.message.includes('rate_limit') || 
+                         error.message.includes('overloaded') || 
+                         error.message.includes('529') ||
+                         error.message.includes('timeout');
+
+      if (!isRetryable) {
+        throw error;
+      }
+
+      const delay = Math.min(
+        this.retryConfig.baseDelay * Math.pow(2, attempt - 1),
+        this.retryConfig.maxDelay
+      );
+      
+      console.log(`⏳ Retrying Claude API request (${attempt}/${this.retryConfig.maxRetries}) after ${delay}ms...`);
+      await this.sleep(delay);
+      
+      return this.retryRequest(requestFn, attempt + 1);
     }
-    
-    return responseText;
-    
+  }
+
+  // Main API call method
+  async makeRequest(prompt, options = {}) {
+    // Check cache first
+    const cached = this.getCachedResponse(prompt);
+    if (cached && !options.bypassCache) {
+      return cached;
+    }
+
+    // Check rate limit
+    if (!this.checkRateLimit()) {
+      throw new Error('Rate limit exceeded - please try again later');
+    }
+
+    const requestFn = async () => {
+      console.log('=== CLAUDE API REQUEST ===');
+      console.log('Prompt length:', prompt.length);
+      console.log('Rate limit usage:', `${this.rateLimit.requests}/${this.rateLimit.maxRequests}`);
+      
+      this.rateLimit.requests++;
+      
+      const response = await anthropic.messages.create({
+        model: options.model || 'claude-3-5-sonnet-20241022',
+        max_tokens: options.maxTokens || 2000,
+        temperature: options.temperature || 0.1,
+        messages: [{
+          role: 'user',
+          content: prompt
+        }]
+      });
+      
+      console.log('=== CLAUDE API RESPONSE ===');
+      console.log('Response content length:', response.content?.[0]?.text?.length || 0);
+      
+      const responseText = response.content[0].text;
+      console.log('First 200 chars of response:', responseText.substring(0, 200));
+      
+      // Enhanced JSON validation
+      if (!responseText.trim().startsWith('{')) {
+        console.error('❌ Claude response does not start with JSON:');
+        console.error('Response:', responseText.substring(0, 500));
+        throw new Error('Claude returned non-JSON response');
+      }
+      
+      // Try to parse JSON with better error handling
+      try {
+        const parsed = JSON.parse(responseText);
+        console.log('✅ JSON parsing successful');
+        
+        // Cache the response
+        this.setCachedResponse(prompt, responseText);
+        
+        return responseText;
+      } catch (jsonError) {
+        console.error('❌ JSON parsing failed:');
+        console.error('JSON Error:', jsonError.message);
+        console.error('Response that failed to parse:', responseText);
+        throw new Error(`JSON parsing failed: ${jsonError.message}`);
+      }
+    };
+
+    return this.retryRequest(requestFn);
+  }
+
+  // Get cache statistics
+  getCacheStats() {
+    return {
+      size: this.responseCache.size,
+      hitRate: this.cacheHits / (this.cacheHits + this.cacheMisses) || 0,
+      rateLimit: this.rateLimit
+    };
+  }
+
+  // Clear cache
+  clearCache() {
+    this.responseCache.clear();
+    console.log('✅ Claude response cache cleared');
+  }
+}
+
+// Initialize the Claude API manager
+const claudeManager = new ClaudeAPIManager();
+
+// Enhanced Claude API helper with optimizations
+const analyzeWithClaude = async (prompt, options = {}) => {
+  try {
+    return await claudeManager.makeRequest(prompt, options);
   } catch (error) {
     console.error('=== CLAUDE API ERROR ===');
     console.error('Error type:', error.constructor.name);
     console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
     
-    // Check for specific error types
+    // Enhanced error classification
     if (error.message.includes('authentication')) {
       console.error('❌ AUTHENTICATION ISSUE - Check your API key');
       throw new Error('Claude API authentication failed - check your API key');
     } else if (error.message.includes('rate_limit')) {
       console.error('❌ RATE LIMIT - Too many requests');
       throw new Error('Claude API rate limit exceeded - please try again later');
+    } else if (error.message.includes('overloaded') || error.message.includes('529')) {
+      console.error('❌ CLAUDE OVERLOADED - Service temporarily unavailable');
+      throw new Error('Claude API is temporarily overloaded - please try again later');
     } else if (error.message.includes('JSON')) {
       console.error('❌ JSON PARSING ISSUE');
       throw new Error('Claude returned invalid JSON response');
+    } else if (error.message.includes('timeout')) {
+      console.error('❌ TIMEOUT - Request took too long');
+      throw new Error('Claude API request timed out - please try again');
     } else {
       console.error('❌ UNKNOWN CLAUDE ERROR');
       throw new Error('Claude analysis service temporarily unavailable');
@@ -270,16 +422,36 @@ const analyzeWithClaude = async (prompt) => {
   }
 };
 
-const testClaudeAPI = async () => {
-  try {
-    console.log('Testing Claude API...');
-    const testResponse = await analyzeWithClaude('Respond with only: {"test": "success"}');
-    console.log('✅ Claude API test successful');
-    return true;
-  } catch (error) {
-    console.error('❌ Claude API test failed:', error.message);
-    return false;
+const testClaudeAPI = async (retries = 3) => {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`Testing Claude API (attempt ${attempt}/${retries})...`);
+      const testResponse = await analyzeWithClaude('Respond with only: {"test": "success"}', { bypassCache: true });
+      console.log('✅ Claude API test successful');
+      
+      // Test the cache as well
+      const cachedResponse = await analyzeWithClaude('Respond with only: {"test": "cached"}');
+      console.log('✅ Claude API cache test successful');
+      
+      return true;
+    } catch (error) {
+      console.error(`❌ Claude API test failed (attempt ${attempt}):`, error.message);
+      
+      // If it's an overload error and we have retries left, wait and try again
+      if ((error.message.includes('overloaded') || error.message.includes('529') || error.message.includes('timeout')) && attempt < retries) {
+        const delay = attempt * 2000; // 2s, 4s, 6s delays
+        console.log(`⏳ Waiting ${delay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      // If it's the last attempt or non-retryable error, return false
+      if (attempt === retries) {
+        return false;
+      }
+    }
   }
+  return false;
 };
 
 // FIXED: Enhanced scam detection function
@@ -384,15 +556,52 @@ function enhancedScamDetection(text) {
 
 // Routes
 
-// Health check
+// Enhanced health check with Claude API manager stats
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    apiKey: process.env.ANTHROPIC_API_KEY ? 'configured' : 'missing',
-    analysisPipeline: bullshitDetector ? 'ready' : 'unavailable',
-    verificationEngine: global.verificationEngine ? 'initialized' : 'not_initialized'
-  });
+  try {
+    const claudeStats = claudeManager ? claudeManager.getCacheStats() : { size: 0, hitRate: 0, rateLimit: { requests: 0, maxRequests: 50 } };
+    const healthData = {
+      status: 'OK',
+      timestamp: new Date().toISOString(),
+      apiKey: process.env.ANTHROPIC_API_KEY ? 'configured' : 'missing',
+      analysisPipeline: bullshitDetector ? 'ready' : 'unavailable',
+      verificationEngine: global.verificationEngine ? 'initialized' : 'not_initialized',
+      webSocketStreaming: wsServer ? 'initialized' : 'initializing',
+      claudeAPI: {
+        cacheSize: claudeStats.size,
+        hitRate: Math.round(claudeStats.hitRate * 100) + '%',
+        rateLimit: `${claudeStats.rateLimit.requests}/${claudeStats.rateLimit.maxRequests}`,
+        status: 'operational'
+      }
+    };
+    
+    res.json(healthData);
+  } catch (error) {
+    res.status(500).json({
+      status: 'ERROR',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// New endpoint for Claude API management
+app.post('/api/claude/cache/clear', (req, res) => {
+  try {
+    claudeManager.clearCache();
+    res.json({ success: true, message: 'Claude cache cleared' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/claude/stats', (req, res) => {
+  try {
+    const stats = claudeManager.getCacheStats();
+    res.json({ success: true, stats });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Verification engine status and statistics
@@ -540,7 +749,7 @@ Respond with ONLY valid JSON:
   }
 }`;
 
-      const claudeResponse = await analyzeWithClaude(claudePrompt);
+      const claudeResponse = await analyzeWithClaude(claudePrompt, { maxTokens: 1500 });
       const claudeAnalysis = JSON.parse(claudeResponse);
       
       return {
@@ -597,11 +806,11 @@ app.post('/api/analyze-text', async (req, res) => {
     
     console.log('🔍 Starting real-time verification analysis...');
     
-    // Initialize verification engine if not already done
+    // Initialize MCP-enhanced verification engine if not already done
     if (!global.verificationEngine) {
-      console.log('🔄 Initializing verification engine...');
-      const VerificationEngine = require('./services/verification/VerificationEngine');
-      global.verificationEngine = new VerificationEngine();
+      console.log('🔄 Initializing MCP-enhanced verification engine...');
+      const MCPVerificationEngine = require('./services/verification/MCPVerificationEngine');
+      global.verificationEngine = new MCPVerificationEngine();
       await global.verificationEngine.initialize();
     }
     
@@ -627,7 +836,15 @@ app.post('/api/analyze-text', async (req, res) => {
             final_verdict: verificationResult.explanation.summary,
             verification_sources: verificationResult.sources.results.map(s => s.source),
             consensus: verificationResult.consensus
-          }
+          },
+          // Add sources in a format the frontend expects
+          sources: verificationResult.sources.results.map(source => ({
+            name: source.source,
+            status: source.status,
+            confidence: source.confidence,
+            data: source.data,
+            error: source.error || null
+          }))
         };
         
         res.json({
@@ -717,7 +934,7 @@ Respond with ONLY a valid JSON object in this exact format:
 DO NOT include any text outside the JSON.`;
 
   try {
-    const claudeResponse = await analyzeWithClaude(analysisPrompt);
+    const claudeResponse = await analyzeWithClaude(analysisPrompt, { maxTokens: 1500 });
     const claudeAnalysis = JSON.parse(claudeResponse);
     
     // Use the HIGHER suspicion level between our analysis and Claude's
@@ -840,7 +1057,7 @@ Respond with ONLY valid JSON:
 
 DO NOT include any text outside the JSON.`;
 
-    const claudeResponse = await analyzeWithClaude(investigationPrompt);
+    const claudeResponse = await analyzeWithClaude(investigationPrompt, { maxTokens: 1500 });
     const analysis = JSON.parse(claudeResponse);
     
     res.json({
@@ -880,6 +1097,15 @@ app.use((error, req, res, next) => {
 process.on('SIGTERM', async () => {
   console.log('Received SIGTERM, shutting down gracefully');
   
+  // Clean up WebSocket server
+  if (wsServer) {
+    try {
+      await wsServer.shutdown();
+    } catch (error) {
+      console.error('Error shutting down WebSocket server:', error.message);
+    }
+  }
+  
   // Clean up verification engine
   if (global.verificationEngine) {
     try {
@@ -903,6 +1129,15 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   console.log('Received SIGINT, shutting down gracefully');
+  
+  // Clean up WebSocket server
+  if (wsServer) {
+    try {
+      await wsServer.shutdown();
+    } catch (error) {
+      console.error('Error shutting down WebSocket server:', error.message);
+    }
+  }
   
   // Clean up verification engine
   if (global.verificationEngine) {
@@ -953,13 +1188,27 @@ const startServer = async () => {
       console.log('   Starting anyway, but Claude features will be disabled');
     }
     
-    app.listen(PORT, () => {
+    // Start HTTP server first
+    server.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`📊 Health: http://localhost:${PORT}/health`);
       console.log(`🔍 Analysis Pipeline: ${pipelineReady ? 'Ready' : 'Fallback Mode'}`);
       console.log(`✅ Claude API: ${claudeWorks ? 'Working' : 'Failed'}`);
       console.log(`📸 Image Analysis: POST /api/analyze-image`);
       console.log(`📝 Text Analysis: POST /api/analyze-text`);
+      console.log(`🔴 WebSocket Streaming: ws://localhost:${PORT}/ws/verification`);
+    });
+    
+    // Initialize WebSocket server asynchronously (non-blocking)
+    console.log('🔗 Initializing WebSocket server for real-time streaming...');
+    setImmediate(async () => {
+      try {
+        wsServer = new VerificationWebSocketServer(server);
+        console.log('✅ WebSocket server initialized successfully');
+      } catch (error) {
+        console.error('❌ WebSocket server initialization failed:', error.message);
+        console.log('🔄 Server will continue without WebSocket streaming');
+      }
     });
     
   } catch (error) {

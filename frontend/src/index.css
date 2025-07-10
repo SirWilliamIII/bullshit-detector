@@ -2,6 +2,9 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Enhanced Source Display Animations */
+@import './sourceAnimations.css';
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',

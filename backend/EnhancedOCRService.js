@@ -1,10 +1,10 @@
 // Enhanced OCR Service for Bullshit Detector
 // Implements multi-engine fallback with confidence scoring
 
-import { createWorker, createScheduler, PSM } from "tesseract.js";
-import sharp from "sharp";
-import { promises as fs } from "fs";
-import path from "path";
+const { createWorker, createScheduler, PSM } = require("tesseract.js");
+const sharp = require("sharp");
+const fs = require("fs").promises;
+const path = require("path");
 
 class EnhancedOCRService {
   constructor() {
@@ -406,4 +406,4 @@ class EnhancedOCRService {
   }
 }
 
-export default EnhancedOCRService;
+module.exports = EnhancedOCRService;
